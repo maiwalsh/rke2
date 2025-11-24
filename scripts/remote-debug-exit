@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -ex
+
+cd $(dirname $0)/..
+
+dlv connect :2345 <<< '
+q
+y
+'

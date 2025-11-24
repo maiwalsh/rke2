@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -ex
+
+cd $(dirname $0)/..
+
+. ./scripts/version.sh
+
+COMMAND="server"
+GODEBUG="y"
+
+./bin/${PROG} ${COMMAND} ${ARGS}

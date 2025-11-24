@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+set -ex
+
+if [ -n "${SKIP_VALIDATE}" ]; then
+    echo "skipping validation. continuing..."
+    exit 0
+fi
+
+fatal() {
+    echo '[ERROR] ' "$@" >&2
+    exit 1
+}
+
+function check_win_binaries() {
+    #  Upstream hasn't released a new version of crictl for 1.26 yet; skip the check entirely until they do.
+    #  I'm not honestly even sure that there is any guarantee of a cri-tools release for every Kubernetes minor.
+    #if [ -z "${RC}" ]; then
+    #    CRICTL_WINDOWS_VERSION=$(grep 'CRICTL_VERSION=' Dockerfile.windows | cut -d '=' -f 2- | grep -oE "v([0-9]+)\.([0-9]+)")
+    #    if [ ! "$CRICTL_WINDOWS_VERSION" = "v$VERSION_MAJOR.$VERSION_MINOR" ]; then
+    #       fatal "crictl windows binary version [$CRICTL_WINDOWS_VERSION] does not match kubernetes version"
+    #    fi
+    #fi
+    #
+
+    CALICO_WINDOWS_VERSION=$(grep 'CALICO_VERSION=' Dockerfile.windows | cut -d '=' -f 2- | grep -oE "v([0-9]+)\.([0-9]+)\.([0-9]+)")
+    CALICO_LINUX_VERSION=$(yq '.charts[] | select(.filename == "/charts/rke2-calico.yaml").version' charts/chart_versions.yaml | cut -d ',' -f 1 | sed 's/..$//')
+    if [ ! "$CALICO_WINDOWS_VERSION" = "$CALICO_LINUX_VERSION" ]; then
+        fatal "Calico windows binary version [$CALICO_WINDOWS_VERSION] does not match Calico chart version [$CALICO_LINUX_VERSION]"
+    fi
+
+    CONTAINERD_WINDOWS_VERSION=$(grep "rancher/hardened-containerd" Dockerfile.windows | grep ':v' | cut -d '=' -f 2- | grep -oE "([0-9]+)\.([0-9]+)\.([0-9]+)")
+    CONTAINERD_LINUX_VERSION=$(grep "rancher/hardened-containerd" Dockerfile | grep ':v' | cut -d '=' -f 2- | grep -oE "([0-9]+)\.([0-9]+)\.([0-9]+)")
+    if [ "$CONTAINERD_LINUX_VERSION" != "$CONTAINERD_WINDOWS_VERSION" ]; then
+        fatal "Containerd windows binary version [$CONTAINERD_WINDOWS_VERSION] does not match Containerd linux version [$CONTAINERD_LINUX_VERSION]"
+    fi
+
+    FLANNEL_WINDOWS_VERSION=$(grep 'ENV FLANNEL_VERSION=' Dockerfile.windows | cut -d '=' -f 2- | grep -oE "v([0-9]+)\.([0-9]+)\.([0-9]+)")
+    FLANNEL_LINUX_VERSION=$(yq '.charts[] | select(.filename == "/charts/rke2-flannel.yaml").version' charts/chart_versions.yaml | cut -d ',' -f 1- | sed 's/..$//')
+    if [ ! "$FLANNEL_WINDOWS_VERSION" = "$FLANNEL_LINUX_VERSION" ]; then
+        fatal "Flanneld windows binary version [$FLANNEL_WINDOWS_VERSION] does not match Flanneld chart version [$FLANNEL_LINUX_VERSION]"
+    fi
+}
+
+if ! command -v golangci-lint; then
+    echo Skipping validation: no golangci-lint available
+    exit
+fi
+
+cd $(dirname $0)/..
+GO=${GO-go}
+
+echo Running validation
+
+echo Running: golangci-lint
+#CGO_ENABLED=0 golangci-lint run -v
+
+echo Running: go mod tidy
+go mod tidy
+
+. ./scripts/version.sh
+
+if [ -n "$DIRTY" ]; then
+    echo Source dir is dirty
+    git status --porcelain --untracked-files=no
+    exit 1
+fi
+
+check_win_binaries

@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -ex
+
+cd $(dirname $0)/..
+
+source ./scripts/version.sh
+
+mkdir -p dist/bundle/share/${PROG}
+
+### bundle underlay
+rsync -a bundle/ dist/bundle/
+
+### bin/rke2
+install -s bin/${PROG} dist/bundle/bin/
+
+### share/rke2/LICENSE
+cp -vf LICENSE dist/bundle/share/${PROG}/LICENSE.txt
+
+### (setup directory)
+mkdir -p dist/artifacts
+
+### (make the tarball)
+if [ -z "${PACKAGE_SKIP_TARBALL}" ]; then
+  tar -czf dist/artifacts/${RELEASE}.tar.gz -C dist/bundle --exclude share/rke2-windows --exclude '*.exe' --exclude '*.ps*' $(find dist/bundle -mindepth 1 -maxdepth 1 -type d -exec basename {} \;)
+fi

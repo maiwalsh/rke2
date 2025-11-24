@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -ex
+
+cd $(dirname $0)/..
+
+source ./scripts/version.sh
+
+mkdir -p dist/{artifacts,bundle}
+
+./scripts/package-binary
+./scripts/package-windows-binary
+./scripts/package-bundle
+./scripts/package-windows-bundle

@@ -1,0 +1,26 @@
+#!/bin/bash
+
+set -e -x
+cd $(dirname $0)/..
+
+docker ps
+
+. ./tests/docker/test-helpers
+
+artifacts=$(pwd)/dist/artifacts
+mkdir -p $artifacts
+
+# ---
+
+if [ "$ARCH" != 'amd64' ]; then
+    early-exit "Skipping remaining tests, images not available for $ARCH."
+fi
+
+E2E_OUTPUT=$artifacts test-run-sonobuoy
+echo "Did test-run-sonobuoy $?"
+# ---
+
+#test-run-sonobuoy mysql
+#test-run-sonobuoy postgres
+
+exit 0

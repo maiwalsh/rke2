@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -e
+
+BUILD_REGEX="build[0-9]+"
+
+info() {
+    echo '[INFO] ' "$@"
+}
+
+fatal() {
+    echo '[ERROR] ' "$@" >&2
+    exit 1
+}
+
+function parse_tag() {
+    if [ -z $1 ]; then
+        fatal "tag required as argument"
+        exit 1
+    fi
+    tag=$1
+    if [[ "${tag}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)([-+][a-zA-Z0-9]+)?[-+](rke2r[0-9]+)$ ]]; then
+        MAJOR=${BASH_REMATCH[1]}
+        MINOR=${BASH_REMATCH[2]}
+        PATCH=${BASH_REMATCH[3]}
+        RC=${BASH_REMATCH[4]}
+        RKE2_PATCH=${BASH_REMATCH[5]}
+    fi
+}
+
+function get-module-version() {
+  go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $1
+}
+
+function check_release_branch() {
+    TAG_BRANCH=$(git branch --all -q --contains $GIT_TAG | grep origin | grep -vE 'dependabot|updatecli|origin$|HEAD' | sed -e 's/^[[:space:]]*//' | tail -1)
+    if [ "$TAG_BRANCH" == "remotes/origin/master" ]; then
+        K8S_VERSION_GO_MOD=$(get-module-version k8s.io/kubernetes | cut -d. -f1-2)
+        if [ "v$MAJOR.$MINOR" == "$K8S_VERSION_GO_MOD" ]; then
+            info "Tag $GIT_TAG is cut from master"
+            return
+        fi
+    fi
+    if [ ! "$TAG_BRANCH" = "remotes/origin/release-$MAJOR.$MINOR" ]; then
+        fatal "Tag is cut from the wrong branch $TAG_BRANCH"
+    fi
+}
+
+function check_kubernetes_version() {
+    if [[ ! "$KUBERNETES_IMAGE_TAG" =~ v$MAJOR.$MINOR.$PATCH-$RKE2_PATCH-$BUILD_REGEX ]]; then
+        fatal "Kubernetes image tag [$KUBERNETES_IMAGE_TAG] is incorrect for this tag"
+    fi
+
+    if [[ ! "$KUBERNETES_VERSION" =~ v$MAJOR.$MINOR.$PATCH ]]; then
+        fatal "Kubernetes version variable [$KUBERNETES_VERSION] is incorrect, please correct the version to v$MAJOR.$MINOR.$PATCH"
+    fi
+
+}
+
+. ./scripts/version.sh
+
+git fetch origin -f --tags
+parse_tag $GITHUB_ACTION_TAG
+check_release_branch
+check_kubernetes_version

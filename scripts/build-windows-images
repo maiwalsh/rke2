@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -ex
+
+cd $(dirname $0)/..
+
+source ./scripts/version.sh
+
+if [ "${GOARCH}" == "s390x" ] || [ "${GOARCH}" == "arm64" ]; then
+    exit 0
+fi
+
+mkdir -p build
+
+cat <<EOF >build/windows-images.txt
+${REGISTRY}/${REPO}/${PROG}-runtime:${DOCKERIZED_VERSION}-windows-amd64
+${REGISTRY}/${REPO}/mirrored-pause:${PAUSE_VERSION}
+EOF

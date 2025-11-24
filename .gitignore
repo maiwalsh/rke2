@@ -1,0 +1,13 @@
+/.dapper
+/.cache
+/bin
+/dist
+*.swp
+.idea
+.vscode
+/data
+/rke2
+/build
+.vagrant/
+.DS_Store
+go.work*

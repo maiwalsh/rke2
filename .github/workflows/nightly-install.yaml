@@ -1,0 +1,78 @@
+name: Nightly Install
+on:
+  schedule:
+    - cron: "0 0 * * 1-5"
+  workflow_dispatch: {}
+jobs:
+  test:
+    name: "Smoke Test"
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: [stable]
+        vm: [centos-9, rocky-8, opensuse-leap, ubuntu-2404, windows-2019, windows-2022]
+        include:
+          - {channel: latest, vm: rocky-8}
+          - {channel: latest, vm: ubuntu-2404}
+      max-parallel: 2
+    defaults:
+      run:
+        working-directory: tests/install/${{ matrix.vm }}
+    env:
+      INSTALL_RKE2_CHANNEL: ${{ matrix.channel }}
+    steps:
+      - name: "Checkout"
+        uses: actions/checkout@v6
+        with: {fetch-depth: 1}
+      # Don't cache Windows VMs, they are 5GB each, which would eat our entire 10GB cache
+      - name: "Vagrant Cache"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        uses: actions/cache@v4
+        with:
+          path: |
+             ~/.vagrant.d/boxes
+          key: vagrant-box-${{ matrix.vm }}
+        id: vagrant-cache
+        continue-on-error: true
+      - name: Set up vagrant and libvirt
+        uses: ./.github/actions/vagrant-setup
+      - name: "Vagrant Plugin(s)"
+        run: vagrant plugin install vagrant-reload vagrant-rke2
+      - name: "Vagrant Up ⏩ Install RKE2"
+        run: vagrant up
+      - name: "⏳ Node"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-wait-for-cp
+      - name: "⏳ Canal"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-wait-for-canal
+        continue-on-error: true
+      - name: "⏳ CoreDNS"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-wait-for-coredns
+        continue-on-error: true
+      - name: "⏳ Metrics Server"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-wait-for-metrics-server
+        continue-on-error: true
+      - name: "⏳ Ingress NGINX"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-wait-for-ingress-nginx
+        continue-on-error: true
+      - name: "rke2-status"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-status
+      - name: "rke2-procps"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-procps
+      - name: "rke2-mount-directory"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-mount-directory
+      - name: "rke2-killall"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-killall
+      - name: "rke2-check-mount"
+        if: ${{ !contains(matrix.vm, 'windows') }}
+        run: vagrant provision --provision-with=rke2-check-mount

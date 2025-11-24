@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -ex
+
+cd $(dirname $0)/..
+
+source ./scripts/version.sh
+
+set -- docker container run \
+    --env WORKSPACE=${PWD} \
+    --hostname ${PROG}-server \
+    --interactive \
+    --name ${PROG}-dev-shell \
+    --privileged \
+    --publish ":2345:2345" \
+    --rm \
+    --tty \
+    --volume "${HOME}:${HOME}:ro" \
+    --volume "${PROG}-pkg:/go/pkg" \
+    --volume "${PROG}-cache:/root/.cache/go-build" \
+    --volume "${PWD}:${PWD}" \
+    --volume "/run/k3s" \
+    --volume "/var/lib/rancher/rke2" \
+    --workdir "${PWD}"
+
+if [ -z "${SKIP_PRELOAD_IMAGE}" ]; then
+    set -- "${@}" "--volume" "${PWD}/build/images:/var/lib/rancher/rke2/agent/images"
+fi
+
+exec "${@}" "${PROG}-dev" "bash"

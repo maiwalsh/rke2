@@ -1,0 +1,44 @@
+{
+	"linters": {
+		"disable-all": true,
+		"enable": [
+			"govet",
+			"revive",
+			"goimports",
+			"misspell",
+			"ineffassign",
+			"gofmt"
+		]
+	},
+	"linters-settings": {
+		"govet": {
+			"check-shadowing": false
+		}
+	},
+	"run": {
+		"skip-files": [
+			"/zz_generated_"
+		],
+		"skip-dirs": [
+			"bundle",
+			"charts",
+			"contrib",
+			"developer-docs",
+			"scripts",
+			"docs"
+		],
+		"timeout": "10m"
+	},
+	"issues": {
+		"exclude-rules": [
+			{
+				"linters": "typecheck",
+				"text": "imported but not used"
+			},
+			{
+				"linters": "revive",
+				"text": "should have comment"
+			}
+		]
+	}
+}

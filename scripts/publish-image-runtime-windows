@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -ex
+
+cd $(dirname $0)/..
+
+source ./scripts/version.sh
+
+docker buildx build ${IID_FILE_FLAG} \
+    --sbom=true \
+    --attest type=provenance,mode=max \
+    --build-arg TAG=${VERSION} \
+    --build-arg KUBERNETES_VERSION=${KUBERNETES_VERSION} \
+    --build-arg MAJOR=${VERSION_MAJOR} \
+    --build-arg MINOR=${VERSION_MINOR} \
+    --build-arg CACHEBUST="$(date +%s%N)" \
+    --tag ${REPO}/${PROG}-runtime:${DOCKERIZED_VERSION}-windows-amd64 \
+    --target windows-runtime \
+    --file Dockerfile.windows \
+    --platform windows/amd64 \
+    --push \
+    .
