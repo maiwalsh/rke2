@@ -131,29 +131,115 @@ EOF
 ### 2.3 Enable and Start RKE2 Server
 
 ```bash
-# Enable the service
+# Enable the service to start on boot
 sudo systemctl enable rke2-server.service
 
-# Start the service
+# Start the service now
 sudo systemctl start rke2-server.service
 
 # Check status
 sudo systemctl status rke2-server.service
 ```
 
-### 2.4 Verify Installation
+**On RHEL/CentOS/Amazon Linux, the service will likely be failing.** Check the logs:
 
 ```bash
-# Wait for the service to start (may take 1-2 minutes)
 sudo journalctl -u rke2-server -f
+```
 
-# Once started, set up kubectl access
-export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
-export PATH=$PATH:/var/lib/rancher/rke2/bin
+**Expected issue:** Errors about `nm-cloud-setup.service` with the service repeatedly restarting.
 
-# Verify the node is ready
+Press `Ctrl+C` to stop watching logs.
+
+#### Understanding the Networking Conflict
+
+**Why does this fail on RHEL-based systems?**
+
+RKE2 needs complete control over networking to configure Kubernetes CNI (Container Network Interface). This includes:
+- Creating virtual network interfaces (veth pairs)
+- Setting up routing tables and iptables rules
+- Managing IP address allocation for pods
+- Configuring network policies
+
+On RHEL/CentOS/Amazon Linux, the `nm-cloud-setup` service (part of NetworkManager) automatically configures networking for cloud instances. If both services try to manage networking simultaneously, they create conflicting configurations that break cluster communication.
+
+RKE2 proactively checks for this conflict and refuses to start if `nm-cloud-setup` is enabled, preventing a broken cluster.
+
+#### Resolving the Conflict
+
+Disable nm-cloud-setup so RKE2 can manage networking:
+
+```bash
+# Stop RKE2 (already failing, but be explicit)
+sudo systemctl stop rke2-server.service
+
+# Disable and stop NetworkManager cloud setup
+sudo systemctl disable nm-cloud-setup.service nm-cloud-setup.timer
+sudo systemctl stop nm-cloud-setup.service nm-cloud-setup.timer
+
+# Verify it's disabled
+sudo systemctl status nm-cloud-setup.service
+# Should show: "disabled" and "inactive (dead)"
+
+# Start RKE2 again
+sudo systemctl start rke2-server.service
+
+# Monitor startup - should succeed this time
+sudo journalctl -u rke2-server -f
+```
+
+**Successful startup indicators:**
+- "Starting containerd"
+- "Starting etcd"
+- "Node registered successfully"
+- Logs stabilize after 1-2 minutes
+
+Press `Ctrl+C` when stable.
+
+### 2.4 Configure kubectl Access
+
+**Why we can't use kubectl directly:**
+
+RKE2 runs as root and creates `/etc/rancher/rke2/rke2.yaml` with root-only permissions. Your user account can't read this file. While you could use `sudo kubectl` for every command, this is inconvenient and non-standard.
+
+**Standard Kubernetes practice:** Copy the kubeconfig to `~/.kube/config` in your home directory where all Kubernetes tools expect to find it.
+
+```bash
+# Create standard .kube directory
+mkdir -p ~/.kube
+
+# Copy kubeconfig from RKE2's location
+sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/config
+
+# Change ownership to your user
+# $(id -u) = your user ID, $(id -g) = your group ID
+sudo chown $(id -u):$(id -g) ~/.kube/config
+
+# Secure the file (Kubernetes security best practice)
+chmod 600 ~/.kube/config
+```
+
+**Configure environment:**
+
+```bash
+# Make kubectl and config available in all sessions
+echo 'export KUBECONFIG=~/.kube/config' >> ~/.bashrc
+echo 'export PATH=$PATH:/var/lib/rancher/rke2/bin' >> ~/.bashrc
+
+# Apply to current session
+source ~/.bashrc
+
+# Verify cluster access
 kubectl get nodes
 ```
+
+**Expected output:**
+```
+NAME                    STATUS   ROLES                       AGE   VERSION
+your-node-name          Ready    control-plane,etcd,master   2m    v1.33.x+rke2
+```
+
+**If node shows "NotReady":** Wait 30-60 seconds for CNI initialization, then check again.
 
 ### 2.5 Get the Node Token
 
