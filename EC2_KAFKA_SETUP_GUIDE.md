@@ -1,16 +1,16 @@
-# RKE2 on EC2 with Confluent Kafka Deployment Guide
+# RKE2 on EC2 with Confluent Kafka - Complete Deployment Guide
 
-This guide walks you through setting up an RKE2 Kubernetes cluster on AWS EC2 instances and deploying Confluent Kafka.
+This guide provides step-by-step instructions for deploying RKE2 Kubernetes cluster on AWS EC2 and running Confluent Kafka with KRaft mode (ZooKeeper-free).
 
 ## Table of Contents
 - [Prerequisites](#prerequisites)
-- [Step 1: Prepare EC2 Instances](#step-1-prepare-ec2-instances)
-- [Step 2: Install RKE2 Server (Control Plane)](#step-2-install-rke2-server-control-plane)
-- [Step 3: Install RKE2 Agent (Worker Nodes)](#step-3-install-rke2-agent-worker-nodes)
-- [Step 4: Configure kubectl Access](#step-4-configure-kubectl-access)
-- [Step 5: Deploy Confluent Kafka](#step-5-deploy-confluent-kafka)
-- [Step 6: Verify and Test Kafka](#step-6-verify-and-test-kafka)
+- [Part 1: EC2 Instance Setup](#part-1-ec2-instance-setup)
+- [Part 2: Install RKE2](#part-2-install-rke2)
+- [Part 3: Configure kubectl Access](#part-3-configure-kubectl-access)
+- [Part 4: Deploy Confluent Kafka with KRaft](#part-4-deploy-confluent-kafka-with-kraft)
+- [Part 5: Verify and Test](#part-5-verify-and-test)
 - [Troubleshooting](#troubleshooting)
+- [Reference](#reference)
 
 ---
 
@@ -18,593 +18,708 @@ This guide walks you through setting up an RKE2 Kubernetes cluster on AWS EC2 in
 
 ### AWS EC2 Requirements
 
-**Minimum Setup:**
-- 1 server node (control plane): t3.medium or larger (2 vCPU, 4GB RAM)
-- 2+ worker nodes: t3.medium or larger (2 vCPU, 4GB RAM)
+**Instance Type:**
+- **Minimum:** t3.medium (2 vCPU, 4GB RAM)
+- **Recommended:** t3.2xlarge (8 vCPU, 32GB RAM)
+
+**Disk Size (CRITICAL):**
+- **Minimum:** 30GB EBS root volume
+- **Recommended:** 100GB EBS root volume
+
+**Why disk size matters:**
+```
+RHEL 8 base OS:              ~4GB
+RKE2 + containerd:           ~3GB
+Kafka container images:      ~2-3GB per image × 6 pods = ~18GB
+Kafka persistent data:       3 controllers × 10GB + 3 brokers × 10GB = 60GB
+System overhead:             ~2GB
+────────────────────────────────
+Total:                       ~87GB
+```
 
 **Operating System:**
-- Ubuntu 20.04/22.04 LTS, RHEL 8/9, or Amazon Linux 2023
+- RHEL 8.x, CentOS 8.x, Amazon Linux 2023, or Ubuntu 20.04/22.04 LTS
 
 **Security Group Configuration:**
-Open the following ports:
 
-**Server Node:**
-- 22/tcp - SSH
-- 6443/tcp - Kubernetes API
-- 9345/tcp - RKE2 supervisor API
-- 10250/tcp - Kubelet metrics
-- 2379-2380/tcp - etcd client and peer
-- 8472/udp - Flannel VXLAN (if using Flannel)
-- 4240/tcp - Cilium health checks (if using Cilium)
-
-**Worker Nodes:**
-- 22/tcp - SSH
-- 10250/tcp - Kubelet metrics
-- 8472/udp - Flannel VXLAN
-- 30000-32767/tcp - NodePort Services
-
-**All Nodes:**
-- Allow all traffic between cluster nodes (private subnet recommended)
+| Port | Protocol | Purpose | Source |
+|------|----------|---------|--------|
+| 22 | TCP | SSH | Your IP |
+| 6443 | TCP | Kubernetes API | Your IP / VPC CIDR |
+| 9345 | TCP | RKE2 supervisor API (for worker nodes) | VPC CIDR |
+| 10250 | TCP | Kubelet metrics | VPC CIDR |
+| 30000-32767 | TCP | NodePort Services (if exposing Kafka externally) | Your IP |
 
 ---
 
-## Step 1: Prepare EC2 Instances
+## Part 1: EC2 Instance Setup
 
-### 1.1 Launch EC2 Instances
+### 1.1 Launch EC2 Instance
 
 ```bash
-# Example using AWS CLI (adjust as needed)
+# Example using AWS CLI
 aws ec2 run-instances \
-  --image-id ami-0c55b159cbfafe1f0 \
-  --count 3 \
-  --instance-type t3.medium \
+  --image-id ami-xxxxxx \
+  --count 1 \
+  --instance-type t3.2xlarge \
   --key-name your-key-pair \
   --security-group-ids sg-xxxxxxxxx \
   --subnet-id subnet-xxxxxxxxx \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=rke2-node}]'
+  --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":100,"VolumeType":"gp3"}}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=rke2-kafka-node}]'
 ```
 
-### 1.2 SSH into All Nodes
+**Critical:** Set `VolumeSize` to at least 100 for the root volume.
+
+### 1.2 Connect to Instance
 
 ```bash
-ssh -i your-key.pem ubuntu@<server-node-ip>
+# For RHEL/Amazon Linux
+ssh -i your-key.pem ec2-user@<public-ip>
+
+# For Ubuntu
+ssh -i your-key.pem ubuntu@<public-ip>
 ```
 
-### 1.3 Update System (on all nodes)
+### 1.3 Update System
 
 ```bash
-# For Ubuntu/Debian
-sudo apt-get update && sudo apt-get upgrade -y
-
-# For RHEL/CentOS/Amazon Linux
+# RHEL/CentOS/Amazon Linux
 sudo yum update -y
+
+# Ubuntu
+sudo apt-get update && sudo apt-get upgrade -y
 ```
 
-### 1.4 Disable Swap (required for Kubernetes)
+### 1.4 Verify Disk Space
 
 ```bash
-sudo swapoff -a
-sudo sed -i '/ swap / s/^/#/' /etc/fstab
+df -h /
 ```
 
-### 1.5 Set Hostnames (optional but recommended)
-
-```bash
-# On server node
-sudo hostnamectl set-hostname rke2-server
-
-# On worker nodes
-sudo hostnamectl set-hostname rke2-worker-1
-sudo hostnamectl set-hostname rke2-worker-2
-```
+**Expected output:** Size should show at least 30GB, ideally 100GB.
 
 ---
 
-## Step 2: Install RKE2 Server (Control Plane)
-
-Run these commands on your designated **server node**.
+## Part 2: Install RKE2
 
 ### 2.1 Download and Install RKE2
 
 ```bash
-# Download the RKE2 installation script
 curl -sfL https://get.rke2.io | sudo sh -
 ```
 
-### 2.2 Create RKE2 Configuration
+**What this installs:**
+- RKE2 binaries in `/var/lib/rancher/rke2/bin/`
+- Systemd service files
+- Containerd runtime
+- kubectl, crictl utilities
+
+### 2.2 Enable RKE2 Service
 
 ```bash
-# Create config directory
-sudo mkdir -p /etc/rancher/rke2
-
-# Create configuration file
-sudo tee /etc/rancher/rke2/config.yaml > /dev/null <<EOF
-write-kubeconfig-mode: "0644"
-tls-san:
-  - "$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)"
-  - "$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)"
-node-label:
-  - "node-role.kubernetes.io/server=true"
-EOF
-```
-
-### 2.3 Enable and Start RKE2 Server
-
-```bash
-# Enable the service to start on boot
 sudo systemctl enable rke2-server.service
-
-# Start the service now
-sudo systemctl start rke2-server.service
-
-# Check status
-sudo systemctl status rke2-server.service
 ```
 
-**On RHEL/CentOS/Amazon Linux, the service will likely be failing.** Check the logs:
+### 2.3 Handle NetworkManager Conflict (RHEL/CentOS/Amazon Linux Only)
+
+**Skip this section if using Ubuntu.**
+
+#### 2.3.1 Why This is Necessary
+
+RKE2 requires exclusive control over network configuration to manage:
+- Container Network Interface (CNI) for pod networking
+- Virtual network interfaces (veth pairs)
+- IP routing tables and iptables rules
+- Network policies
+
+RHEL-based systems include `nm-cloud-setup` service that auto-configures networking for cloud instances. This conflicts with RKE2's CNI, causing the service to fail repeatedly.
+
+#### 2.3.2 Disable nm-cloud-setup
 
 ```bash
-sudo journalctl -u rke2-server -f
-```
-
-**Expected issue:** Errors about `nm-cloud-setup.service` with the service repeatedly restarting.
-
-Press `Ctrl+C` to stop watching logs.
-
-#### Understanding the Networking Conflict
-
-**Why does this fail on RHEL-based systems?**
-
-RKE2 needs complete control over networking to configure Kubernetes CNI (Container Network Interface). This includes:
-- Creating virtual network interfaces (veth pairs)
-- Setting up routing tables and iptables rules
-- Managing IP address allocation for pods
-- Configuring network policies
-
-On RHEL/CentOS/Amazon Linux, the `nm-cloud-setup` service (part of NetworkManager) automatically configures networking for cloud instances. If both services try to manage networking simultaneously, they create conflicting configurations that break cluster communication.
-
-RKE2 proactively checks for this conflict and refuses to start if `nm-cloud-setup` is enabled, preventing a broken cluster.
-
-#### Resolving the Conflict
-
-Disable nm-cloud-setup so RKE2 can manage networking:
-
-```bash
-# Stop RKE2 (already failing, but be explicit)
-sudo systemctl stop rke2-server.service
-
 # Disable and stop NetworkManager cloud setup
 sudo systemctl disable nm-cloud-setup.service nm-cloud-setup.timer
 sudo systemctl stop nm-cloud-setup.service nm-cloud-setup.timer
 
 # Verify it's disabled
 sudo systemctl status nm-cloud-setup.service
-# Should show: "disabled" and "inactive (dead)"
+```
 
-# Start RKE2 again
+**Expected output:** Should show "disabled" and "inactive (dead)".
+
+### 2.4 Start RKE2
+
+```bash
 sudo systemctl start rke2-server.service
+```
 
-# Monitor startup - should succeed this time
+### 2.5 Verify RKE2 is Running
+
+```bash
+# Check service status
+sudo systemctl status rke2-server.service
+
+# Watch logs (Ctrl+C to exit)
 sudo journalctl -u rke2-server -f
 ```
 
-**Successful startup indicators:**
-- "Starting containerd"
-- "Starting etcd"
-- "Node registered successfully"
-- Logs stabilize after 1-2 minutes
+**Success indicators:**
+```
+... Starting containerd ...
+... Starting etcd ...
+... Node registered successfully ...
+```
 
-Press `Ctrl+C` when stable.
+**Startup time:** 1-2 minutes for first start (longer on slower instances).
 
-### 2.4 Configure kubectl Access
+---
 
-**Why we can't use kubectl directly:**
+## Part 3: Configure kubectl Access
 
-RKE2 runs as root and creates `/etc/rancher/rke2/rke2.yaml` with root-only permissions. Your user account can't read this file. While you could use `sudo kubectl` for every command, this is inconvenient and non-standard.
+### 3.1 Understanding the Permission Issue
 
-**Standard Kubernetes practice:** Copy the kubeconfig to `~/.kube/config` in your home directory where all Kubernetes tools expect to find it.
+RKE2 runs as root and creates `/etc/rancher/rke2/rke2.yaml` with root-only permissions (600). Your user account cannot read this file.
+
+**Why not just chmod?**
+- RKE2 owns and may update this file
+- Standard Kubernetes practice is `~/.kube/config` in user home directory
+- All Kubernetes tools default to looking there
+
+### 3.2 Copy kubeconfig to User Home
 
 ```bash
-# Create standard .kube directory
+# Create .kube directory
 mkdir -p ~/.kube
 
-# Copy kubeconfig from RKE2's location
+# Copy kubeconfig
 sudo cp /etc/rancher/rke2/rke2.yaml ~/.kube/config
 
 # Change ownership to your user
-# $(id -u) = your user ID, $(id -g) = your group ID
 sudo chown $(id -u):$(id -g) ~/.kube/config
 
-# Secure the file (Kubernetes security best practice)
+# Secure the file (best practice)
 chmod 600 ~/.kube/config
 ```
 
-**Configure environment:**
+### 3.3 Configure Environment
 
 ```bash
-# Make kubectl and config available in all sessions
-echo 'export KUBECONFIG=~/.kube/config' >> ~/.bashrc
-echo 'export PATH=$PATH:/var/lib/rancher/rke2/bin' >> ~/.bashrc
+# Add to .bash_profile (for persistent sessions)
+echo 'export PATH=$PATH:/var/lib/rancher/rke2/bin' >> ~/.bash_profile
+echo 'export KUBECONFIG=~/.kube/config' >> ~/.bash_profile
 
 # Apply to current session
-source ~/.bashrc
+source ~/.bash_profile
+```
 
-# Verify cluster access
+**Why .bash_profile instead of .bashrc?**
+- `.bash_profile` loads first on login shells
+- `.bashrc` may not run or may be overwritten by `.bash_profile`
+- Using `.bash_profile` ensures kubectl works after re-login
+
+### 3.4 Verify kubectl Works
+
+```bash
 kubectl get nodes
 ```
 
 **Expected output:**
 ```
-NAME                    STATUS   ROLES                       AGE   VERSION
-your-node-name          Ready    control-plane,etcd,master   2m    v1.33.x+rke2
-```
-
-**If node shows "NotReady":** Wait 30-60 seconds for CNI initialization, then check again.
-
-### 2.5 Get the Node Token
-
-You'll need this token to join worker nodes:
-
-```bash
-sudo cat /var/lib/rancher/rke2/server/node-token
-```
-
-**Save this token** - you'll need it for worker nodes!
-
----
-
-## Step 3: Install RKE2 Agent (Worker Nodes)
-
-Run these commands on each **worker node**.
-
-### 3.1 Download and Install RKE2 Agent
-
-```bash
-# Set the installation type to agent
-export INSTALL_RKE2_TYPE="agent"
-
-# Download and install
-curl -sfL https://get.rke2.io | sudo sh -
-```
-
-### 3.2 Configure RKE2 Agent
-
-```bash
-# Create config directory
-sudo mkdir -p /etc/rancher/rke2
-
-# Create configuration file
-# Replace <SERVER_IP> with your server node's private IP
-# Replace <NODE_TOKEN> with the token from step 2.5
-sudo tee /etc/rancher/rke2/config.yaml > /dev/null <<EOF
-server: https://<SERVER_IP>:9345
-token: <NODE_TOKEN>
-node-label:
-  - "node-role.kubernetes.io/worker=true"
-EOF
-```
-
-### 3.3 Enable and Start RKE2 Agent
-
-```bash
-# Enable the service
-sudo systemctl enable rke2-agent.service
-
-# Start the service
-sudo systemctl start rke2-agent.service
-
-# Check status
-sudo systemctl status rke2-agent.service
-```
-
-### 3.4 Verify Worker Nodes
-
-From the **server node**, check that all nodes have joined:
-
-```bash
-kubectl get nodes
-```
-
-You should see all nodes in a "Ready" state.
-
----
-
-## Step 4: Configure kubectl Access
-
-### 4.1 Set Up kubectl on Server Node
-
-```bash
-# Add to your ~/.bashrc or ~/.bash_profile
-echo 'export KUBECONFIG=/etc/rancher/rke2/rke2.yaml' >> ~/.bashrc
-echo 'export PATH=$PATH:/var/lib/rancher/rke2/bin' >> ~/.bashrc
-source ~/.bashrc
-```
-
-### 4.2 (Optional) Configure kubectl from Your Local Machine
-
-```bash
-# On the server node, copy the kubeconfig
-sudo cat /etc/rancher/rke2/rke2.yaml
-
-# On your local machine, save to ~/.kube/config
-# Replace 127.0.0.1 with your server's public IP
-# Then test:
-kubectl get nodes
+NAME                  STATUS   ROLES                       AGE   VERSION
+ip-172-31-xx-xx       Ready    control-plane,etcd,master   2m    v1.33.x+rke2
 ```
 
 ---
 
-## Step 5: Deploy Confluent Kafka
+## Part 4: Deploy Confluent Kafka with KRaft
 
-### 5.1 Install Helm (if not already installed)
+### 4.1 Install Helm
 
 ```bash
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Verify installation
+helm version
 ```
 
-### 5.2 Add Confluent Helm Repository
+### 4.2 Configure Storage Class
+
+RKE2 includes the `local-path` storage provisioner, but it's not set as default.
 
 ```bash
-helm repo add confluentinc https://confluentinc.github.io/cp-helm-charts/
-helm repo update
+# Set local-path as default storage class
+kubectl patch storageclass local-path \
+  -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+# Verify
+kubectl get storageclass
 ```
 
-### 5.3 Create a Namespace for Kafka
-
-```bash
-kubectl create namespace kafka
+**Expected output:**
+```
+NAME                   PROVISIONER             RECLAIMPOLICY   VOLUMEBINDINGMODE      ALLOWVOLUMEEXPANSION   AGE
+local-path (default)   rancher.io/local-path   Delete          WaitForFirstConsumer   false                  5m
 ```
 
-### 5.4 Create Kafka Configuration File
+**What this does:**
+- Enables automatic persistent volume creation
+- Without default storage class, Kafka pods stay "Pending"
+- Local-path creates volumes on node disk at `/opt/local-path-provisioner/`
 
-Create a `kafka-values.yaml` file with custom settings:
+### 4.3 Download Confluent for Kubernetes
+
+Confluent for Kubernetes (CFK) is **not** available in public Helm repositories. It must be downloaded as a bundle.
 
 ```bash
-cat > kafka-values.yaml <<EOF
-cp-zookeeper:
-  enabled: true
-  servers: 3
-  persistence:
-    enabled: true
-    dataDirStorageClass: "local-path"
-    dataDirSize: 5Gi
-  resources:
-    requests:
-      cpu: 250m
-      memory: 512Mi
+# Download CFK bundle (~218MB)
+curl -O https://packages.confluent.io/bundle/cfk/confluent-for-kubernetes-3.1.0.tar.gz
 
-cp-kafka:
-  enabled: true
-  brokers: 3
-  persistence:
-    enabled: true
-    storageClass: "local-path"
-    size: 5Gi
-  resources:
-    requests:
-      cpu: 250m
-      memory: 1Gi
-  configurationOverrides:
-    "offsets.topic.replication.factor": "3"
-    "default.replication.factor": "3"
-    "min.insync.replicas": "2"
+# Extract
+tar -xvf confluent-for-kubernetes-3.1.0.tar.gz
 
-cp-schema-registry:
-  enabled: true
-  replicaCount: 1
+# Verify extraction
+ls -la confluent-for-kubernetes-3.1.0-*/
+```
 
-cp-kafka-rest:
-  enabled: true
+### 4.4 Install Confluent for Kubernetes Operator
 
-cp-kafka-connect:
-  enabled: false
+```bash
+# Install from extracted bundle
+helm upgrade --install confluent-operator \
+  ./confluent-for-kubernetes-3.1.0-*/helm/confluent-for-kubernetes \
+  --set kRaftEnabled=true \
+  --namespace confluent \
+  --create-namespace
+```
 
-cp-ksql-server:
-  enabled: false
+**Parameters explained:**
+- `kRaftEnabled=true`: Enables KRaft controller support in operator
+- `--namespace confluent`: Creates dedicated namespace for Confluent components
+- `--create-namespace`: Creates namespace if it doesn't exist
 
-cp-control-center:
-  enabled: false
+**Verify operator is running:**
+```bash
+kubectl get pods -n confluent
+```
+
+**Expected output:**
+```
+NAME                                 READY   STATUS    RESTARTS   AGE
+confluent-operator-xxxxx-xxxxx       1/1     Running   0          30s
+```
+
+### 4.5 Deploy KRaft Controllers and Kafka Brokers
+
+Create the Kafka cluster configuration:
+
+```bash
+cat > confluent-kafka-kraft.yaml << 'EOF'
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: KRaftController
+metadata:
+  name: kraftcontroller
+  namespace: confluent
+spec:
+  replicas: 3
+  image:
+    application: confluentinc/cp-server:7.9.1
+    init: confluentinc/confluent-init-container:2.9.1
+  dataVolumeCapacity: 10Gi
+  storageClass:
+    name: local-path
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: Kafka
+metadata:
+  name: kafka
+  namespace: confluent
+spec:
+  replicas: 3
+  image:
+    application: confluentinc/cp-server:7.9.1
+    init: confluentinc/confluent-init-container:2.9.1
+  dataVolumeCapacity: 10Gi
+  storageClass:
+    name: local-path
+  dependencies:
+    kRaftController:
+      clusterRef:
+        name: kraftcontroller
 EOF
 ```
 
-### 5.5 Install Kafka using Helm
+**Configuration breakdown:**
+
+**KRaftController:**
+- `replicas: 3` - Creates 3 controller nodes (odd number required for Raft consensus)
+- `application: confluentinc/cp-server:7.9.1` - Official Confluent Platform image
+- `init: confluentinc/confluent-init-container:2.9.1` - Init container for configuration
+- `dataVolumeCapacity: 10Gi` - 10GB persistent storage per controller
+- Controllers handle cluster metadata, leader elections, and coordination
+
+**Kafka:**
+- `replicas: 3` - Creates 3 broker nodes
+- Brokers handle message storage, replication, and client connections
+- `dependencies.kRaftController` - Links brokers to controller cluster
+
+### 4.6 Apply Configuration
 
 ```bash
-helm install kafka confluentinc/cp-helm-charts \
-  --namespace kafka \
-  --values kafka-values.yaml
+kubectl apply -f confluent-kafka-kraft.yaml
 ```
 
-### 5.6 Wait for Pods to be Ready
+### 4.7 Watch Deployment
 
 ```bash
-# Watch the pods come up
-kubectl get pods -n kafka -w
-
-# It may take 3-5 minutes for all pods to be ready
+kubectl get pods -n confluent -w
 ```
+
+**Deployment sequence:**
+1. **kraftcontroller-0, -1, -2**: Init:0/1 → PodInitializing → Running (2-3 minutes each)
+2. **kafka-0, -1, -2**: Init:0/1 → PodInitializing → Running (2-3 minutes each, after controllers are ready)
+
+**Total deployment time:** 5-8 minutes depending on network speed.
+
+Press `Ctrl+C` once all pods show "1/1 Running".
+
+### 4.8 Verify All Components
+
+```bash
+kubectl get all -n confluent
+```
+
+**Expected resources:**
+- 1 operator pod
+- 3 KRaft controller pods
+- 3 Kafka broker pods
+- Services for kafka, kraftcontroller
+- 6 PersistentVolumeClaims (10Gi each)
 
 ---
 
-## Step 6: Verify and Test Kafka
+## Part 5: Verify and Test
 
-### 6.1 Check Pod Status
+### 5.1 Create Test Client Pod
 
 ```bash
-kubectl get pods -n kafka
+kubectl run kafka-client -n confluent \
+  --image=confluentinc/cp-server:7.9.1 \
+  --restart=Never \
+  --command -- sleep infinity
+
+# Wait for pod to be ready
+kubectl wait --for=condition=ready pod/kafka-client -n confluent --timeout=60s
 ```
 
-All pods should show `Running` status.
-
-### 6.2 Get Kafka Services
+### 5.2 Create Test Topic
 
 ```bash
-kubectl get svc -n kafka
-```
-
-### 6.3 Test Kafka - Create a Topic
-
-```bash
-# Get the Kafka broker pod name
-KAFKA_POD=$(kubectl get pod -n kafka -l app=cp-kafka -o jsonpath='{.items[0].metadata.name}')
-
-# Create a test topic
-kubectl exec -n kafka $KAFKA_POD -- kafka-topics \
-  --bootstrap-server localhost:9092 \
+kubectl exec -n confluent kafka-client -- kafka-topics \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
   --create \
   --topic test-topic \
   --partitions 3 \
   --replication-factor 3
-
-# List topics
-kubectl exec -n kafka $KAFKA_POD -- kafka-topics \
-  --bootstrap-server localhost:9092 \
-  --list
 ```
 
-### 6.4 Test Producer and Consumer
+**Expected output:**
+```
+Created topic test-topic.
+```
 
-**Producer:**
+### 5.3 Describe Topic
+
 ```bash
-# Produce messages
-kubectl exec -n kafka $KAFKA_POD -- bash -c "echo 'Hello Kafka from RKE2!' | kafka-console-producer \
-  --bootstrap-server localhost:9092 \
+kubectl exec -n confluent kafka-client -- kafka-topics \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
+  --describe \
+  --topic test-topic
+```
+
+**Expected output:**
+```
+Topic: test-topic       TopicId: xxxxx  PartitionCount: 3       ReplicationFactor: 3
+        Topic: test-topic       Partition: 0    Leader: 0       Replicas: 0,1,2 Isr: 0,1,2
+        Topic: test-topic       Partition: 1    Leader: 1       Replicas: 1,2,0 Isr: 1,2,0
+        Topic: test-topic       Partition: 2    Leader: 2       Replicas: 2,0,1 Isr: 2,0,1
+```
+
+### 5.4 Produce Messages
+
+```bash
+kubectl exec -n confluent kafka-client -- bash -c \
+  "echo 'Message 1: Hello from Confluent Kafka on RKE2' | kafka-console-producer \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
+  --topic test-topic"
+
+kubectl exec -n confluent kafka-client -- bash -c \
+  "echo 'Message 2: KRaft mode - no ZooKeeper needed!' | kafka-console-producer \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
   --topic test-topic"
 ```
 
-**Consumer:**
+### 5.5 Consume Messages
+
 ```bash
-# Consume messages
-kubectl exec -n kafka $KAFKA_POD -- kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
+kubectl exec -n confluent kafka-client -- kafka-console-consumer \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
   --topic test-topic \
   --from-beginning \
-  --max-messages 1
+  --max-messages 2
 ```
 
-### 6.5 Expose Kafka (Optional)
-
-To access Kafka from outside the cluster:
-
-```bash
-# Create a NodePort service
-kubectl expose service kafka-cp-kafka \
-  --name=kafka-external \
-  --namespace=kafka \
-  --type=NodePort \
-  --port=9092 \
-  --target-port=9092
-
-# Get the NodePort
-kubectl get svc kafka-external -n kafka
+**Expected output:**
+```
+Message 1: Hello from Confluent Kafka on RKE2
+Message 2: KRaft mode - no ZooKeeper needed!
+Processed a total of 2 messages
 ```
 
-Then connect using: `<any-node-ip>:<nodeport>`
+**If you see both messages, Kafka is working correctly!** ✅
 
 ---
 
 ## Troubleshooting
 
-### Node Not Ready
+### Issue 1: Pods Stuck in "Pending" - Disk Pressure
 
+**Symptoms:**
 ```bash
-# Check node status
-kubectl describe node <node-name>
+$ kubectl get pods -n confluent
+NAME                STATUS    RESTARTS   AGE
+kafka-0             Pending   0          5m
 
-# Check RKE2 logs
-sudo journalctl -u rke2-server -f  # on server
-sudo journalctl -u rke2-agent -f   # on worker
+$ kubectl describe node | grep Taints
+Taints:  node.kubernetes.io/disk-pressure:NoSchedule
 ```
 
-### Pods Stuck in Pending
+**Root cause:** Disk usage exceeded 85% threshold. Kubernetes applies taint to prevent scheduling new pods.
 
+**Diagnosis:**
 ```bash
-# Check pod events
-kubectl describe pod <pod-name> -n kafka
+# Check disk usage
+df -h /
 
-# Check storage
+# Check for leftover PVCs from failed deployments
+kubectl get pvc --all-namespaces
+
+# Check PersistentVolumes
 kubectl get pv
-kubectl get pvc -n kafka
 ```
 
-### Kafka Connection Issues
-
+**Solution 1: Expand EBS Volume**
 ```bash
-# Check Zookeeper first
-kubectl logs -n kafka <zookeeper-pod-name>
+# In AWS Console:
+# EC2 → Volumes → Select volume → Actions → Modify Volume → Increase size to 100GB
 
-# Check Kafka broker logs
-kubectl logs -n kafka <kafka-pod-name>
+# On EC2 instance:
+sudo growpart /dev/nvme0n1 3
+sudo xfs_growfs /
 
-# Test internal connectivity
-kubectl run -it --rm kafka-test --image=confluentinc/cp-kafka:latest --restart=Never -- bash
-# Inside the container:
-kafka-broker-api-versions --bootstrap-server kafka-cp-kafka.kafka.svc.cluster.local:9092
+# Verify
+df -h /
+# Should show new size
 ```
 
-### Insufficient Resources
-
+**Solution 2: Clean Up Leftover PVCs**
 ```bash
-# Check resource usage
-kubectl top nodes
-kubectl top pods -n kafka
+# List all PVCs
+kubectl get pvc --all-namespaces
 
-# If nodes are running out of resources, either:
-# 1. Reduce Kafka resource requests in kafka-values.yaml
-# 2. Add more worker nodes
-# 3. Use larger EC2 instance types
+# Delete PVCs from old deployments
+kubectl delete pvc <pvc-name> -n <namespace>
+
+# Check for Released PVs and delete them
+kubectl get pv
+kubectl delete pv <pv-name>
 ```
 
-### Security Group Issues
-
-Ensure all required ports are open between nodes. Test connectivity:
-
+**Solution 3: Prune Container Images**
 ```bash
-# From worker to server (port 6443 and 9345)
-nc -zv <server-ip> 6443
-nc -zv <server-ip> 9345
+sudo /var/lib/rancher/rke2/bin/crictl \
+  --runtime-endpoint unix:///run/k3s/containerd/containerd.sock \
+  rmi --prune
+```
+
+**Solution 4: Remove Taint Manually (after fixing disk)**
+```bash
+kubectl taint nodes --all node.kubernetes.io/disk-pressure:NoSchedule-
+```
+
+**Solution 5: Delete and Recreate Pending Pods**
+```bash
+# Delete pods stuck in Pending
+kubectl delete pod <pod-name> -n confluent
+
+# Deployment will recreate them automatically
+```
+
+### Issue 2: kubectl Not Found After Re-login
+
+**Symptom:** After logout/login, `kubectl: command not found`
+
+**Root cause:** `.bash_profile` runs before `.bashrc` and may overwrite PATH.
+
+**Solution:**
+```bash
+# Add to .bash_profile instead of .bashrc
+echo 'export PATH=$PATH:/var/lib/rancher/rke2/bin' >> ~/.bash_profile
+echo 'export KUBECONFIG=~/.kube/config' >> ~/.bash_profile
+source ~/.bash_profile
+```
+
+### Issue 3: No Storage Class Available
+
+**Symptom:** Pods stuck in Pending with message "unbound immediate PersistentVolumeClaims"
+
+**Solution:**
+```bash
+kubectl patch storageclass local-path \
+  -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+### Issue 4: RKE2 Won't Start on RHEL/CentOS
+
+**Symptom:**
+```bash
+$ sudo journalctl -u rke2-server -f
+... error about nm-cloud-setup.service ...
+... service restart counter at 100+ ...
+```
+
+**Solution:** Disable nm-cloud-setup (see Part 2, Section 2.3)
+
+### Issue 5: Pods in "Evicted" Status
+
+**Symptom:** `kubectl get pods` shows multiple pods with "Evicted" status
+
+**Root cause:** Kubernetes evicted pods due to resource pressure (disk/memory).
+
+**Solution:**
+```bash
+# Delete evicted pods (they're already dead)
+kubectl get pods -n confluent | grep Evicted | awk '{print $1}' | \
+  xargs kubectl delete pod -n confluent
+
+# Fix underlying cause (usually disk pressure)
+```
+
+### Issue 6: "ContainerStatusUnknown"
+
+**Symptom:** Pods stuck in "ContainerStatusUnknown" status
+
+**Root cause:** Node was under heavy resource pressure, kubelet lost connection to pods.
+
+**Solution:**
+```bash
+# Delete affected pods
+kubectl delete pods -n confluent --all
+
+# Deployment will recreate them
+# Fix underlying resource issue (usually disk pressure)
 ```
 
 ---
 
-## Clean Up (Optional)
+## Reference
 
-To remove everything:
+### Service Endpoints
 
-```bash
-# Delete Kafka
-helm uninstall kafka -n kafka
-kubectl delete namespace kafka
-
-# Stop RKE2 on all nodes
-sudo systemctl stop rke2-server  # on server
-sudo systemctl stop rke2-agent   # on workers
-
-# Uninstall RKE2 (if needed)
-sudo /usr/local/bin/rke2-uninstall.sh  # on server
-sudo /usr/local/bin/rke2-agent-uninstall.sh  # on workers
+**Internal Kafka Access (from pods):**
+```
+kafka.confluent.svc.cluster.local:9092
 ```
 
----
+**KRaft Controller (internal only):**
+```
+kraftcontroller.confluent.svc.cluster.local:9093
+```
 
-## Next Steps
+### Key Commands
 
-- Set up monitoring with Prometheus and Grafana
-- Configure ingress for external access
-- Implement backup strategies for Kafka data
-- Set up Kafka Connect for data integration
-- Enable SSL/TLS for Kafka brokers
-- Configure RBAC and pod security policies
+**Check cluster health:**
+```bash
+kubectl get nodes
+kubectl get pods -n confluent
+kubectl get pvc -n confluent
+kubectl get storageclass
+```
+
+**View logs:**
+```bash
+# Kafka broker logs
+kubectl logs -n confluent kafka-0
+
+# Controller logs
+kubectl logs -n confluent kraftcontroller-0
+
+# Operator logs
+kubectl logs -n confluent deployment/confluent-operator -f
+```
+
+**Scale cluster:**
+```bash
+# Edit resource to change replicas
+kubectl edit kafka kafka -n confluent
+
+# Or update YAML and reapply
+kubectl apply -f confluent-kafka-kraft.yaml
+```
+
+**Delete everything:**
+```bash
+kubectl delete -f confluent-kafka-kraft.yaml
+helm uninstall confluent-operator -n confluent
+kubectl delete namespace confluent
+```
+
+### File Locations
+
+**RKE2:**
+- Config: `/etc/rancher/rke2/config.yaml`
+- Kubeconfig: `/etc/rancher/rke2/rke2.yaml`
+- Data directory: `/var/lib/rancher/rke2/`
+- Binaries: `/var/lib/rancher/rke2/bin/`
+- Logs: `journalctl -u rke2-server`
+
+**Kafka Storage:**
+- PVC mount point: `/opt/local-path-provisioner/pvc-<uuid>_<namespace>_<pvc-name>/`
+
+### Images Used
+
+- **Confluent Kafka:** `confluentinc/cp-server:7.9.1`
+- **Init container:** `confluentinc/confluent-init-container:2.9.1`
+- **Operator:** `docker.io/confluentinc/confluent-operator:0.949.1` (automatically pulled by Helm)
+
+### Resource Requirements
+
+**Per Pod:**
+- KRaft Controller: ~512MB RAM, 0.5 CPU, 10Gi disk
+- Kafka Broker: ~1GB RAM, 1 CPU, 10Gi disk
+- Operator: ~256MB RAM, 0.1 CPU
+
+**Total for 3-node cluster:**
+- ~7GB RAM
+- ~4.5 CPU
+- 60Gi disk (persistent volumes)
+
+### API Versions
+
+- Confluent for Kubernetes: `platform.confluent.io/v1beta1`
+- Storage Class: `storage.k8s.io/v1`
+- Kubernetes: `v1.33.x+rke2`
 
 ---
 
 ## Additional Resources
 
-- [RKE2 Official Documentation](https://docs.rke2.io/)
-- [Confluent Helm Charts](https://github.com/confluentinc/cp-helm-charts)
-- [Kubernetes Documentation](https://kubernetes.io/docs/)
-- [Kafka Documentation](https://kafka.apache.org/documentation/)
+- [Confluent for Kubernetes Documentation](https://docs.confluent.io/operator/current/overview.html)
+- [RKE2 Documentation](https://docs.rke2.io/)
+- [Kafka KRaft Mode](https://kafka.apache.org/documentation/#kraft)
+- [Kubernetes Persistent Volumes](https://kubernetes.io/docs/concepts/storage/persistent-volumes/)
 
 ---
 
-**Happy Clustering! 🚀**
+**End of Guide**

@@ -8,8 +8,45 @@ This is a straightforward guide that explains **what** you're doing and **why** 
 
 You want to:
 1. Install RKE2 (a Kubernetes distribution) on your EC2 instance
-2. Use that Kubernetes cluster to run Confluent Kafka in a pod
+2. Use that Kubernetes cluster to run Confluent Kafka with KRaft mode (no ZooKeeper)
 3. Understand how everything connects
+
+---
+
+## Part 0: EC2 Instance Setup (IMPORTANT)
+
+### Disk Size Requirements
+
+**Critical:** Your EC2 instance needs adequate disk space. Here's why:
+
+- **RHEL/CentOS base OS:** ~4GB
+- **RKE2 and container runtime:** ~3GB
+- **Kafka container images:** ~2-3GB
+- **Kafka data storage:** Varies based on usage
+- **Kubernetes overhead:** ~1-2GB
+
+**Minimum:** 30GB EBS volume
+**Recommended:** 100GB EBS volume
+
+**What happens if your disk is too small:**
+- Pods get stuck in "Pending" state
+- Kubernetes applies a "disk pressure taint" to the node
+- New pods cannot schedule
+- You'll need to expand the EBS volume mid-deployment (painful)
+
+**How to set disk size during EC2 launch:**
+1. In EC2 console, when configuring storage
+2. Set root volume size to at least 30GB (100GB recommended)
+3. If your instance already exists, you can resize the EBS volume in AWS console, then run:
+   ```bash
+   sudo growpart /dev/nvme0n1 3
+   sudo xfs_growfs /
+   ```
+
+### Instance Type Requirements
+
+**Minimum:** t3.medium (2 vCPU, 4GB RAM)
+**Recommended:** t3.2xlarge (8 vCPU, 32GB RAM) for running Kafka with 3 brokers + 3 controllers
 
 ---
 
@@ -21,10 +58,14 @@ RKE2 is Rancher's Kubernetes distribution. When you install it, you're essential
 ### Step 1: SSH into Your EC2 Instance
 
 ```bash
-ssh -i your-key.pem ubuntu@your-ec2-ip
+ssh -i your-key.pem ec2-user@your-ec2-ip
 ```
 
 **What you're doing:** Just connecting to your server.
+
+**Note:** Username depends on your OS:
+- RHEL/Amazon Linux: `ec2-user`
+- Ubuntu: `ubuntu`
 
 ### Step 2: Decide Your Node Type
 
@@ -233,7 +274,16 @@ Helm is like a package manager for Kubernetes (think apt/yum for Linux). It bund
 
 ---
 
-## Part 3: Deploying Confluent Kafka
+## Part 3: Deploying Confluent Kafka with KRaft Mode
+
+### What is KRaft Mode?
+
+**ZooKeeper was deprecated in November 2025.** KRaft (Kafka Raft) is the new architecture that removes the ZooKeeper dependency. Instead of ZooKeeper coordinating the cluster, Kafka now has dedicated controller nodes that handle metadata using the Raft consensus protocol.
+
+**Why this matters:**
+- Simpler architecture (fewer moving parts)
+- Better performance and scalability
+- Official Confluent direction going forward
 
 ### Step 1: Install Helm
 
@@ -241,77 +291,153 @@ Helm is like a package manager for Kubernetes (think apt/yum for Linux). It bund
 curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
 ```
 
-**What's happening:** Installing Helm, which we'll use to deploy Kafka easily.
+**What's happening:** Installing Helm 3, required for deploying Confluent for Kubernetes.
 
-### Step 2: Add the Confluent Helm Repository
+### Step 2: Set Up Storage Class
+
+RKE2 includes a storage provisioner called `local-path` that creates storage volumes on the node's disk. We need to set it as the default:
 
 ```bash
-helm repo add confluentinc https://confluentinc.github.io/cp-helm-charts/
-helm repo update
+kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+**Why this matters:**
+- Kafka needs persistent storage for its data
+- Without a default storage class, Kafka pods will remain "Pending"
+- This tells Kubernetes where to create storage volumes
+
+Verify it worked:
+```bash
+kubectl get storageclass
+```
+
+You should see `local-path` marked as `(default)`.
+
+### Step 3: Download Confluent for Kubernetes
+
+**Important:** Confluent for Kubernetes (CFK) is NOT in public Helm repositories. You must download it as a bundle:
+
+```bash
+# Download the official CFK bundle
+curl -O https://packages.confluent.io/bundle/cfk/confluent-for-kubernetes-3.1.0.tar.gz
+
+# Extract it
+tar -xvf confluent-for-kubernetes-3.1.0.tar.gz
 ```
 
 **What's happening:**
-- Adding Confluent's Helm chart repository (like adding a package source)
-- Updating the list of available charts
+- Downloading ~218MB bundle containing the operator and examples
+- Extracting to a directory with timestamp in the name
 
-**Think of it like:** Adding a new software repository to your package manager.
-
-### Step 3: Create a Namespace for Kafka
+### Step 4: Install the Confluent for Kubernetes Operator
 
 ```bash
-kubectl create namespace kafka
-```
-
-**What's happening:** Creating a dedicated "folder" for Kafka and its components.
-
-**Why:** Keeps Kafka isolated from other apps you might deploy later.
-
-### Step 4: Understand What You're Deploying
-
-Confluent Kafka needs several components:
-
-1. **Zookeeper** (3 pods): Coordinates the Kafka cluster
-2. **Kafka Brokers** (3 pods): The actual Kafka servers
-3. **Schema Registry** (optional): Manages data schemas
-4. **Kafka REST** (optional): REST API for Kafka
-
-**For a basic setup, you need Zookeeper + Kafka Brokers.**
-
-### Step 5: Deploy Kafka with Helm
-
-**Simple deployment (uses defaults):**
-```bash
-helm install kafka confluentinc/cp-helm-charts \
-  --namespace kafka \
-  --set cp-zookeeper.servers=1 \
-  --set cp-kafka.brokers=1
+# Install from the extracted bundle
+helm upgrade --install confluent-operator \
+  ./confluent-for-kubernetes-3.1.0-*/helm/confluent-for-kubernetes \
+  --set kRaftEnabled=true \
+  --namespace confluent \
+  --create-namespace
 ```
 
 **What's happening:**
-- `helm install kafka`: Installing a release named "kafka"
-- `--namespace kafka`: Put it in the kafka namespace
-- `--set cp-zookeeper.servers=1`: Run 1 Zookeeper instance (simple setup)
-- `--set cp-kafka.brokers=1`: Run 1 Kafka broker (simple setup)
+- Installing the CFK operator (the "brain" that manages Kafka)
+- Enabling KRaft mode support
+- Creating a new namespace called `confluent`
 
-**Note:** For production, you'd use 3 of each for high availability, but 1 is fine for learning.
+**Why the operator pattern:**
+- The operator watches for Kafka resource definitions
+- Automatically creates and manages all necessary Kubernetes resources
+- Handles upgrades, scaling, and recovery
 
-### Step 6: Watch It Deploy
-
+Verify the operator is running:
 ```bash
-kubectl get pods -n kafka -w
+kubectl get pods -n confluent
 ```
 
-**What you'll see:**
-- Pods starting up with status "ContainerCreating"
-- Then "Running" after a few minutes
-- Press `Ctrl+C` to stop watching
+You should see `confluent-operator-xxxxx` in "Running" status.
+
+### Step 5: Deploy KRaft Controllers and Kafka Brokers
+
+Create a configuration file for your Kafka cluster:
+
+```bash
+cat > confluent-kafka-kraft.yaml << 'EOF'
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: KRaftController
+metadata:
+  name: kraftcontroller
+  namespace: confluent
+spec:
+  replicas: 3
+  image:
+    application: confluentinc/cp-server:7.9.1
+    init: confluentinc/confluent-init-container:2.9.1
+  dataVolumeCapacity: 10Gi
+  storageClass:
+    name: local-path
+---
+apiVersion: platform.confluent.io/v1beta1
+kind: Kafka
+metadata:
+  name: kafka
+  namespace: confluent
+spec:
+  replicas: 3
+  image:
+    application: confluentinc/cp-server:7.9.1
+    init: confluentinc/confluent-init-container:2.9.1
+  dataVolumeCapacity: 10Gi
+  storageClass:
+    name: local-path
+  dependencies:
+    kRaftController:
+      clusterRef:
+        name: kraftcontroller
+EOF
+```
+
+**What each part means:**
+
+**KRaftController:**
+- `replicas: 3`: Creates 3 controller nodes (odd number required for Raft consensus)
+- `application: confluentinc/cp-server:7.9.1`: Official Confluent Platform image
+- `dataVolumeCapacity: 10Gi`: Each controller gets 10GB of storage
+- Controllers manage cluster metadata, handle leader elections, and coordinate the cluster
+
+**Kafka:**
+- `replicas: 3`: Creates 3 Kafka broker nodes
+- Brokers handle actual message storage and client connections
+- `dependencies.kRaftController`: Links brokers to the controllers
+
+**Why 3 replicas:**
+- Provides high availability
+- Allows 1 node to fail without data loss
+- Enables proper replication and failover
+
+Apply the configuration:
+```bash
+kubectl apply -f confluent-kafka-kraft.yaml
+```
+
+### Step 6: Watch the Deployment
+
+```bash
+kubectl get pods -n confluent -w
+```
+
+**What you'll see (in this order):**
+1. **kraftcontroller-0, -1, -2** pods: Init → Running (2-3 minutes)
+2. **kafka-0, -1, -2** pods: Init → Running (2-3 minutes after controllers are ready)
 
 **What's happening:**
-- Kubernetes is downloading container images
-- Starting Zookeeper first (Kafka needs it)
-- Then starting Kafka brokers
+- Controllers start first and form a Raft quorum
+- Once controllers are stable, Kafka brokers start
+- Each pod downloads ~2GB of container images
+- Init containers configure the pods before main containers start
 
-This typically takes **2-5 minutes** depending on your instance's network speed.
+Press `Ctrl+C` once all pods show "1/1 Running".
 
 ---
 
@@ -320,81 +446,103 @@ This typically takes **2-5 minutes** depending on your instance's network speed.
 ### Step 1: Check All Pods are Running
 
 ```bash
-kubectl get pods -n kafka
+kubectl get pods -n confluent
 ```
 
-**You should see all pods with STATUS = "Running".**
+**You should see:**
+- `confluent-operator-xxxxx`: 1/1 Running
+- `kraftcontroller-0, -1, -2`: 1/1 Running
+- `kafka-0, -1, -2`: 1/1 Running
 
-### Step 2: Check Services
+**Total: 7 pods, all in "Running" status.**
 
-```bash
-kubectl get svc -n kafka
-```
+### Step 2: Create a Test Client Pod
 
-**What you'll see:** Services that provide networking to your Kafka pods.
-
-Look for:
-- `kafka-cp-kafka`: The Kafka broker service
-- `kafka-cp-zookeeper`: The Zookeeper service
-
-### Step 3: Test Kafka - Create a Topic
-
-First, get the Kafka pod name:
-```bash
-kubectl get pods -n kafka | grep cp-kafka
-```
-
-You'll see something like `kafka-cp-kafka-0`. Use that name in the next command:
+Instead of exec'ing into Kafka pods (which can interfere with the cluster), create a dedicated client pod:
 
 ```bash
-kubectl exec -n kafka kafka-cp-kafka-0 -- kafka-topics \
-  --bootstrap-server localhost:9092 \
-  --create \
-  --topic test-topic \
-  --partitions 1 \
-  --replication-factor 1
+kubectl run kafka-client -n confluent \
+  --image=confluentinc/cp-server:7.9.1 \
+  --restart=Never \
+  --command -- sleep infinity
 ```
 
 **What's happening:**
-- `kubectl exec`: Run a command inside a pod
-- `kafka-topics`: Kafka's tool for managing topics
-- `--bootstrap-server localhost:9092`: Connect to Kafka (locally within the pod)
-- `--create --topic test-topic`: Create a new topic named "test-topic"
+- Creating a pod with Kafka tools installed
+- `sleep infinity` keeps it running so we can exec into it
+- This is the proper way to interact with Kafka
+
+Wait for it to be ready:
+```bash
+kubectl wait --for=condition=ready pod/kafka-client -n confluent --timeout=60s
+```
+
+### Step 3: Create a Test Topic
+
+```bash
+kubectl exec -n confluent kafka-client -- kafka-topics \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
+  --create \
+  --topic test-topic \
+  --partitions 3 \
+  --replication-factor 3
+```
+
+**What's happening:**
+- `kafka-topics`: Kafka's command-line tool for managing topics
+- `--bootstrap-server kafka.confluent.svc.cluster.local:9092`: Connect to the Kafka cluster
+  - `kafka`: Service name
+  - `confluent`: Namespace
+  - `svc.cluster.local`: Kubernetes DNS suffix
+  - `9092`: Kafka's default port
+- `--partitions 3`: Split the topic into 3 partitions for parallelism
+- `--replication-factor 3`: Each partition is replicated across all 3 brokers
 
 **What's a topic?** Think of it like a category or channel where messages are published.
 
-### Step 4: List Topics to Verify
+**Why 3 partitions and 3 replicas?**
+- Partitions enable parallel processing
+- Replication ensures no data loss if a broker fails
+
+### Step 4: Verify the Topic
 
 ```bash
-kubectl exec -n kafka kafka-cp-kafka-0 -- kafka-topics \
-  --bootstrap-server localhost:9092 \
-  --list
+kubectl exec -n confluent kafka-client -- kafka-topics \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
+  --describe \
+  --topic test-topic
 ```
 
-**You should see:** `test-topic` in the output.
+**You should see:**
+- Topic details showing 3 partitions
+- Each partition replicated across 3 brokers
+- Leader and replica information
 
-### Step 5: Send a Test Message (Producer)
+### Step 5: Send Test Messages (Producer)
 
 ```bash
-kubectl exec -n kafka kafka-cp-kafka-0 -- bash -c \
-  "echo 'Hello from Kafka!' | kafka-console-producer \
-  --bootstrap-server localhost:9092 \
+kubectl exec -n confluent kafka-client -- bash -c \
+  "echo 'Hello from Confluent Kafka on RKE2!' | kafka-console-producer \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
   --topic test-topic"
 ```
 
-**What's happening:** Sending the message "Hello from Kafka!" to the test-topic.
+**What's happening:**
+- Using `kafka-console-producer` to send a message
+- The message goes to one of the 3 partitions
+- Kafka replicates it to all 3 brokers
 
 ### Step 6: Read the Message (Consumer)
 
 ```bash
-kubectl exec -n kafka kafka-cp-kafka-0 -- kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
+kubectl exec -n confluent kafka-client -- kafka-console-consumer \
+  --bootstrap-server kafka.confluent.svc.cluster.local:9092 \
   --topic test-topic \
   --from-beginning \
   --max-messages 1
 ```
 
-**What you should see:** Your message "Hello from Kafka!" printed out.
+**What you should see:** Your message "Hello from Confluent Kafka on RKE2!" printed out.
 
 **If you see this, congratulations! Kafka is working!** 🎉
 
@@ -406,50 +554,64 @@ kubectl exec -n kafka kafka-cp-kafka-0 -- kafka-console-consumer \
 
 Applications running in Kubernetes can connect to Kafka using the service name:
 ```
-kafka-cp-kafka.kafka.svc.cluster.local:9092
+kafka.confluent.svc.cluster.local:9092
 ```
 
 **Breaking this down:**
-- `kafka-cp-kafka`: Service name
-- `kafka`: Namespace
+- `kafka`: Service name (created by CFK operator)
+- `confluent`: Namespace
 - `svc.cluster.local`: Kubernetes DNS suffix
 - `9092`: Kafka's default port
 
+Your application configuration would look like:
+```properties
+bootstrap.servers=kafka.confluent.svc.cluster.local:9092
+```
+
 ### From Outside the Cluster (Your Applications)
 
-You have a few options:
+For external access, you have a few options:
 
 **Option 1: NodePort (Simple, not production-grade)**
 ```bash
-kubectl expose service kafka-cp-kafka \
+kubectl expose service kafka \
   --name=kafka-external \
-  --namespace=kafka \
+  --namespace=confluent \
   --type=NodePort \
   --port=9092
 ```
 
-Then get the port:
+Get the assigned NodePort:
 ```bash
-kubectl get svc kafka-external -n kafka
+kubectl get svc kafka-external -n confluent
 ```
 
 Connect using: `<your-ec2-public-ip>:<nodeport>`
 
-**Important:** Make sure your EC2 security group allows traffic on that NodePort (30000-32767 range).
+**Important:**
+- Make sure your EC2 security group allows traffic on that NodePort (30000-32767 range)
+- NodePort is fine for testing but not recommended for production
 
-**Option 2: LoadBalancer (AWS specific)**
+**Option 2: LoadBalancer (AWS specific, better for production)**
 ```bash
-kubectl expose service kafka-cp-kafka \
+kubectl expose service kafka \
   --name=kafka-lb \
-  --namespace=kafka \
+  --namespace=confluent \
   --type=LoadBalancer \
   --port=9092
 ```
 
 This creates an AWS ELB. Get the address:
 ```bash
-kubectl get svc kafka-lb -n kafka
+kubectl get svc kafka-lb -n confluent
 ```
+
+**Option 3: Port Forward (Development/Testing only)**
+```bash
+kubectl port-forward -n confluent svc/kafka 9092:9092
+```
+
+Then connect to `localhost:9092` from your local machine. Press Ctrl+C to stop.
 
 ---
 
@@ -457,80 +619,289 @@ kubectl get svc kafka-lb -n kafka
 
 ### See What's Running
 ```bash
-kubectl get pods -n kafka
-kubectl get svc -n kafka
+kubectl get pods -n confluent
+kubectl get svc -n confluent
+kubectl get pvc -n confluent  # See persistent storage
 ```
 
 ### Check Pod Logs
 ```bash
-kubectl logs -n kafka <pod-name>
+# Kafka broker logs
+kubectl logs -n confluent kafka-0
+
+# Controller logs
+kubectl logs -n confluent kraftcontroller-0
+
+# Operator logs
+kubectl logs -n confluent deployment/confluent-operator
 ```
 
-### Get Shell Access to Kafka Pod
+### Get Shell Access to Client Pod
 ```bash
-kubectl exec -it -n kafka kafka-cp-kafka-0 -- bash
+kubectl exec -it -n confluent kafka-client -- bash
 ```
 
 **Once inside, you can run any Kafka command directly.**
 
+### Scale the Cluster
+```bash
+# Edit the Kafka resource to change replicas
+kubectl edit kafka kafka -n confluent
+
+# Or update your YAML and reapply
+# Change replicas: 3 to replicas: 5
+kubectl apply -f confluent-kafka-kraft.yaml
+```
+
 ### Delete Everything (Start Over)
 ```bash
-helm uninstall kafka -n kafka
-kubectl delete namespace kafka
+# Delete Kafka and controllers
+kubectl delete -f confluent-kafka-kraft.yaml
+
+# Delete the operator
+helm uninstall confluent-operator -n confluent
+
+# Delete the namespace (this removes PVCs too)
+kubectl delete namespace confluent
 ```
 
 ---
 
-## Troubleshooting Tips
+## Troubleshooting: Common Issues and Solutions
 
-### Pods Stuck in "Pending"
-**Check:** `kubectl describe pod <pod-name> -n kafka`
+### Issue 1: Pods Stuck in "Pending" with Disk Pressure
 
-**Common cause:** Not enough resources. Your EC2 instance might be too small. Kafka needs at least a t3.medium instance.
+**Symptoms:**
+```bash
+kubectl get pods -n confluent
+# Shows pods in "Pending" status
 
-### Pods Stuck in "ContainerCreating"
-**Be patient.** Kubernetes is downloading container images from the internet. This can take 3-5 minutes depending on your network speed.
+kubectl describe node
+# Shows: Taints: node.kubernetes.io/disk-pressure:NoSchedule
+```
 
-**To verify it's actually downloading:** `kubectl describe pod <pod-name> -n kafka` and look for "pulling image" messages.
+**What's happening:**
+- Kubernetes detected high disk usage (>85%)
+- Applied a "disk pressure taint" to protect the node
+- Scheduler refuses to place new pods on tainted nodes
 
-### Can't Connect to Kafka from Outside the Cluster
+**Root causes:**
+- EC2 disk too small (10GB is insufficient)
+- Leftover PersistentVolumeClaims (PVCs) from failed deployments
+- Old container images consuming space
+
+**Solution 1: Check disk usage**
+```bash
+df -h /
+```
+
+If disk is >80% full, you need to expand it.
+
+**Solution 2: Expand EBS volume (if disk is too small)**
+```bash
+# In AWS Console:
+# 1. EC2 → Volumes → Select your volume → Actions → Modify Volume
+# 2. Change size to 100GB → Modify
+
+# Then on the EC2 instance:
+sudo growpart /dev/nvme0n1 3
+sudo xfs_growfs /
+df -h /  # Verify new size
+```
+
+**Solution 3: Clean up leftover PVCs**
+```bash
+# List PVCs
+kubectl get pvc --all-namespaces
+
+# Delete old PVCs (if you see any from deleted deployments)
+kubectl delete pvc <pvc-name> -n <namespace>
+
+# Check PersistentVolumes too
+kubectl get pv
+# If any show "Released" status, delete them:
+kubectl delete pv <pv-name>
+```
+
+**Solution 4: Remove the taint manually (after fixing disk space)**
+```bash
+kubectl taint nodes --all node.kubernetes.io/disk-pressure:NoSchedule-
+```
+
+**Solution 5: Prune old container images**
+```bash
+sudo /var/lib/rancher/rke2/bin/crictl \
+  --runtime-endpoint unix:///run/k3s/containerd/containerd.sock \
+  rmi --prune
+```
+
+### Issue 2: kubectl Not Found After Re-login
+
+**Symptom:** After logging out and back into EC2, `kubectl` command not found.
+
+**What's happening:**
+- `.bashrc` contains your exports, but `.bash_profile` runs first
+- `.bash_profile` might be overwriting your PATH
+
+**Solution:** Add exports to `.bash_profile` instead:
+```bash
+# Edit .bash_profile
+echo 'export PATH=$PATH:/var/lib/rancher/rke2/bin' >> ~/.bash_profile
+echo 'export KUBECONFIG=~/.kube/config' >> ~/.bash_profile
+source ~/.bash_profile
+```
+
+### Issue 3: Pods Stuck in "ContainerCreating"
+
+**Be patient.** Kubernetes is downloading container images. Each Kafka image is ~2GB.
+
+**To verify progress:**
+```bash
+kubectl describe pod <pod-name> -n confluent
+# Look for "pulling image" or "image pull" messages
+```
+
+**Expected time:** 3-5 minutes per pod depending on network speed.
+
+### Issue 4: No Storage Class Available
+
+**Symptom:** Pods stuck in Pending with message "unbound immediate PersistentVolumeClaims"
+
+**Solution:**
+```bash
+# Set local-path as default storage class
+kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+# Verify
+kubectl get storageclass
+# Should show: local-path (default)
+```
+
+### Issue 5: Can't Connect to Kafka from Outside the Cluster
+
 **Check these in order:**
-1. Is your EC2 security group configured to allow traffic on the NodePort? (Check port range 30000-32767)
-2. Did you expose the service as NodePort or LoadBalancer? Run `kubectl get svc -n kafka` to verify
-3. Are you using the correct IP:port? NodePort uses `<ec2-public-ip>:<nodeport>`, not 9092
-4. Is the Kafka pod actually running? `kubectl get pods -n kafka`
+1. **Is your EC2 security group configured?**
+   - Allow traffic on NodePort range (30000-32767)
+   - Or LoadBalancer port (9092)
+
+2. **Did you expose the service?**
+   ```bash
+   kubectl get svc -n confluent
+   # Should see kafka-external or kafka-lb
+   ```
+
+3. **Are you using the correct address?**
+   - NodePort: `<ec2-public-ip>:<nodeport>` (NOT 9092)
+   - LoadBalancer: Use the EXTERNAL-IP from `kubectl get svc`
+
+4. **Is Kafka actually running?**
+   ```bash
+   kubectl get pods -n confluent
+   # All kafka-* pods should be 1/1 Running
+   ```
+
+### Issue 6: RKE2 Won't Start on RHEL/CentOS
+
+**Symptom:** `sudo journalctl -u rke2-server` shows errors about `nm-cloud-setup.service`
+
+**Solution:** See Part 1, Step 4 - disable nm-cloud-setup service.
+
+### Issue 7: "Evicted" Pods
+
+**Symptom:** Pods show status "Evicted"
+
+**What happened:** Kubernetes evicted pods due to resource pressure (disk/memory).
+
+**Solution:**
+```bash
+# Delete evicted pods (they're dead anyway)
+kubectl get pods -n confluent | grep Evicted | awk '{print $1}' | xargs kubectl delete pod -n confluent
+
+# Fix the underlying cause (usually disk pressure - see Issue 1)
+```
 
 ---
 
 ## Key Files and Locations
 
-- **RKE2 config**: `/etc/rancher/rke2/config.yaml`
-- **Kubeconfig**: `/etc/rancher/rke2/rke2.yaml`
-- **RKE2 data**: `/var/lib/rancher/rke2/`
-- **RKE2 logs**: `sudo journalctl -u rke2-server`
+**RKE2:**
+- **Config**: `/etc/rancher/rke2/config.yaml`
+- **Kubeconfig**: `/etc/rancher/rke2/rke2.yaml` (copy to `~/.kube/config`)
+- **Data**: `/var/lib/rancher/rke2/`
+- **Logs**: `sudo journalctl -u rke2-server`
+- **Binaries**: `/var/lib/rancher/rke2/bin/`
+
+**Kafka:**
+- **Configuration file**: `confluent-kafka-kraft.yaml` (in your home directory)
+- **Operator helm chart**: `./confluent-for-kubernetes-3.1.0-*/helm/confluent-for-kubernetes`
+- **Persistent data**: `/opt/local-path-provisioner/pvc-*/` (managed by local-path provisioner)
 
 ---
 
 ## What You've Learned
 
-1. ✅ How to install RKE2 on an EC2 instance
-2. ✅ How RKE2 creates a Kubernetes cluster
-3. ✅ How to use kubectl to interact with Kubernetes
-4. ✅ How to deploy applications using Helm
-5. ✅ How Kafka runs in Kubernetes pods
-6. ✅ How to test Kafka (create topics, produce/consume messages)
-7. ✅ How to expose services for external access
+1. ✅ How to properly size an EC2 instance for Kubernetes + Kafka
+2. ✅ How to install and configure RKE2 on RHEL/CentOS
+3. ✅ How to resolve the nm-cloud-setup networking conflict
+4. ✅ How to configure kubectl access with proper permissions
+5. ✅ How to deploy Confluent for Kubernetes operator
+6. ✅ How KRaft mode works (ZooKeeper-free Kafka)
+7. ✅ How to troubleshoot disk pressure and PVC issues
+8. ✅ How to test Kafka (create topics, produce/consume messages)
+9. ✅ How to connect to Kafka from inside and outside the cluster
+
+---
+
+## Important Takeaways
+
+### Disk Space Matters
+- 10GB is too small for Kubernetes + Kafka
+- Always start with 30GB minimum, 100GB recommended
+- Monitor disk usage: `df -h /`
+- Kubernetes will taint nodes at 85% disk usage
+
+### PVCs Persist After Pod Deletion
+- Deleting pods doesn't delete their storage
+- Always check for leftover PVCs: `kubectl get pvc --all-namespaces`
+- Clean up failed deployments completely
+
+### KRaft vs ZooKeeper
+- KRaft is the future (ZooKeeper deprecated November 2025)
+- Simpler architecture, better performance
+- Use official Confluent images: `confluentinc/cp-server:7.9.1`
+
+### Storage Class Setup
+- RKE2 includes `local-path` provisioner
+- Must be set as default: `kubectl patch storageclass...`
+- Without default storage class, pods stay Pending
 
 ---
 
 ## Next Steps
 
-- **Scale up:** Add more Kafka brokers (`--set cp-kafka.brokers=3`)
-- **Persistence:** Add storage so data survives pod restarts
-- **Monitoring:** Deploy Prometheus/Grafana
-- **Security:** Set up authentication and encryption
-- **Production:** Add more EC2 instances as worker nodes
+### Improve Reliability
+- Add more EC2 instances as worker nodes for true high availability
+- Set up monitoring with Prometheus + Grafana
+- Configure automated backups of Kafka data
+
+### Secure Your Cluster
+- Enable TLS/SSL for Kafka brokers
+- Set up authentication (SASL/SCRAM or mTLS)
+- Configure Kubernetes RBAC
+- Use network policies to restrict pod communication
+
+### Optimize Performance
+- Tune Kafka broker configurations for your workload
+- Adjust resource requests/limits based on usage
+- Consider using EBS volumes instead of local-path for better durability
+- Enable compression for better throughput
+
+### Add Monitoring
+- Deploy Confluent Control Center for Kafka monitoring
+- Set up Prometheus to scrape Kafka metrics
+- Create Grafana dashboards for visualization
+- Configure alerts for disk space, lag, and errors
 
 ---
 
-**You now have a working Kubernetes cluster with Kafka running on it!** 🚀
+**You now have a production-ready Kubernetes cluster running Confluent Kafka with KRaft mode!** 🚀
